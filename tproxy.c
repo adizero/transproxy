@@ -33,6 +33,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 
 #ifdef HAVE_GETOPT_H
 # include <getopt.h>
@@ -175,6 +176,7 @@ static char				*prog;
 static int				daemonize = 1;
 static int				fully_transparent = 0;
 static int				proxy_only = 0;
+static int				inject_connect_port = -1;
 static char				*force_url = NULL;
 static int				force_url_length;
 #ifdef LOG_TO_FILE
@@ -198,6 +200,8 @@ int						deny_severity;
 int						allow_severity;
 #endif
 
+int ignore_response = 0;
+
 /*
  * Main loop.
  */
@@ -216,7 +220,7 @@ int main(int argc, char **argv)
 #endif
 	int					sock;
 	struct sockaddr_in	addr;
-	int					len;
+	unsigned int		len;
 
 	/*
 	 * Get the name if the program.
@@ -234,7 +238,7 @@ int main(int argc, char **argv)
 	/*
 	 * Parse the command line arguments.
 	 */
-	while ((arg = getopt(argc, argv, "dtps:r:b:f:l:a:")) != EOF)
+	while ((arg = getopt(argc, argv, "dtpi:s:r:b:f:l:a:")) != EOF)
 	{
 		switch (arg)
 		{
@@ -246,6 +250,10 @@ int main(int argc, char **argv)
 		case 'p':
 			proxy_only = 1;
 			fully_transparent = 0;
+			break;
+
+		case 'i':
+			inject_connect_port = atoi(optarg);
 			break;
 
 		case 's':
@@ -541,12 +549,13 @@ static void usage(char *prog, char *opt)
 		fprintf(stderr, "%s: %s\n", prog, opt);
 	}
 #ifdef LOG_TO_FILE
-	fprintf(stderr, "usage: %s [-t | -p] [-f url] [-s port [-d] [-b ipaddr] [-r user] [-a acl]] [-l file] proxyhost proxyport\n", prog);
+	fprintf(stderr, "usage: %s [-t | -p] [-i] [-f url] [-s port [-d] [-b ipaddr] [-r user] [-a acl]] [-l file] proxyhost proxyport\n", prog);
 #else
-	fprintf(stderr, "usage: %s [-t | -p] [-f url] [-s port [-d] [-b ipaddr] [-r user] [-a acl]] proxyhost proxyport\n", prog);
+	fprintf(stderr, "usage: %s [-t | -p] [-i] [-f url] [-s port [-d] [-b ipaddr] [-r user] [-a acl]] proxyhost proxyport\n", prog);
 #endif
 	fprintf(stderr, "    -t          Operate transparently, don't talk to a proxy.\n");
 	fprintf(stderr, "    -p          Only talk to a proxy, disable direct fall-back.\n");
+	fprintf(stderr, "    -i portnum  Inject CONNECT message to proxy when going to specific port (0 is wildcard for all ports).\n");
 	fprintf(stderr, "    -f url      Force access to always go to specified URL.\n");
 	fprintf(stderr, "    -s port     Run as a server bound to the specified port.\n");
 	fprintf(stderr, "    -d          Do not background the daemon in server mode.\n");
@@ -865,7 +874,7 @@ static void server_main_loop(int sock, char *server_hostname, short server_port)
 {
 	int					new_sock;
 	struct sockaddr_in	addr;
-	int					len;
+	unsigned int		len;
 	pid_t				pid;
 #ifdef DO_DOUBLE_FORK
 	int					status;
@@ -1019,7 +1028,7 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 {
 	ip_address_t		server_ip;
 	connection_t		conn;
-	int					length;
+	unsigned int		length;
 	int					max_fd;
 	fd_set				read_fd;
 #ifdef IPFILTER
@@ -1134,6 +1143,26 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 			if (conn.proxy_fd != -1)
 				fully_transparent = 1;
 		}
+
+		if ((inject_connect_port != -1) && ((inject_connect_port == 0) || (conn.dest_addr.sin_port == htons(inject_connect_port))))
+		{
+			//send CONNECT
+			static char buf[128];
+			sprintf(buf, "CONNECT %s HTTP/1.1.\r\n\r\n", inet_ntoa(conn.dest_addr.sin_addr));
+			ignore_response = 1;
+			if (!send_data(conn.proxy_fd, buf, strlen(buf)))
+			{
+				ignore_response = 0;
+#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
+				syslog(LOG_ERR, "Could not inject CONNECT message to defined proxy");
+#endif
+			}
+			else
+			{
+				conn.parse_state = PS_TRANSPARENT;
+				//usleep(50000);
+			}
+		}
 	}
 	if (conn.proxy_fd == -1)
 	{
@@ -1193,43 +1222,46 @@ static void trans_proxy(int sock, struct sockaddr_in *from_addr,
 		 */
 		alarm(0);
 
-		/*
-		 * See if any data can be read from the client.
-		 */
-		if (FD_ISSET(conn.client_fd, &read_fd))
+		if (ignore_response == 0)
 		{
-			switch (length = read(conn.client_fd, conn.request_buffer, BUFFER_SIZE))
+			/*
+			 * See if any data can be read from the client.
+			 */
+			if (FD_ISSET(conn.client_fd, &read_fd))
 			{
-			case -1:
-#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
-				if (errno != ECONNRESET)
-					syslog(LOG_WARNING, "read(client) failed: %m");
-# ifdef LOG_TO_SYSLOG
-				else
-					syslog(LOG_INFO, "read(client) failed: %m");
-# endif
-#endif
-				close(conn.proxy_fd);
-				return;
-
-			case 0:
-				close(conn.proxy_fd);
-				return;
-
-			default:
-				/*
-				 * Process requests read from the client. Returns 0 if a
-				 * processed request could not be written to the proxy.
-				 */
-				if (!process_client_request(&conn, length))
+				switch (length = read(conn.client_fd, conn.request_buffer, BUFFER_SIZE))
 				{
-#ifdef LOG_TO_SYSLOG
-					syslog(LOG_WARNING, "write(proxy) failed: %m");
+				case -1:
+#if defined(LOG_TO_SYSLOG) || defined(LOG_FAULTS_TO_SYSLOG)
+					if (errno != ECONNRESET)
+						syslog(LOG_WARNING, "read(client) failed: %m");
+# ifdef LOG_TO_SYSLOG
+					else
+						syslog(LOG_INFO, "read(client) failed: %m");
+# endif
 #endif
 					close(conn.proxy_fd);
 					return;
+
+				case 0:
+					close(conn.proxy_fd);
+					return;
+
+				default:
+					/*
+					 * Process requests read from the client. Returns 0 if a
+					 * processed request could not be written to the proxy.
+					 */
+					if (!process_client_request(&conn, length))
+					{
+#ifdef LOG_TO_SYSLOG
+						syslog(LOG_WARNING, "write(proxy) failed: %m");
+#endif
+						close(conn.proxy_fd);
+						return;
+					}
+					break;
 				}
-				break;
 			}
 		}
 
@@ -1299,6 +1331,12 @@ static int send_data(int fd, char *data, size_t length)
  */
 static int process_proxy_response(connection_t *conn, size_t last_read)
 {
+	if (ignore_response == 1)
+	{
+		ignore_response = 0;
+		return 1;
+	}
+
 	/*
 	 * Write the response to the client.
 	 */
