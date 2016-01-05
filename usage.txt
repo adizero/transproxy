@@ -1,0 +1,20 @@
+#check kernel compile options (see if TPROXY lines have =m)
+cat /boot/config-3.8.0-35-generic
+
+#check and set following kernel settings:
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 1 > /proc/sys/net/ipv4/ip_nonlocal_bind
+
+#download and compile transproxy
+make
+sudo make install
+
+#setup iptables
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 81
+sudo iptables -t nat -A PREROUTING -p tcp --dport 443  -j REDIRECT --to-port 81
+
+#run transproxy (beforehand kill all instances with killall tproxy)
+sudo killall tproxy ; sudo tproxy -i 443 -l /tmp/tproxy.log -s 81 -p -r nobody proxy.lab.sk.alcatel-lucent.com 8888
+
+#check for crashes and problems in /var/log/syslog
+#basic logs will be in /tmp/tproxy.log
